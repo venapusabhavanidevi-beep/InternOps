@@ -123,43 +123,46 @@ async function noticesRoutes(fastify) {
       preHandler: [auth, rbac('ADMIN', 'SENIOR_TL'), sanitize],
     },
     async (req, reply) => {
-      const {
-        title,
-        content,
-        category,
-        image_url,
-        action_button_text,
-        action_button_link,
-        is_featured,
-      } = req.body;
-      if (!title?.trim())
-        return reply.status(400).send({ error: 'title is required' });
-      if (!content?.trim())
-        return reply.status(400).send({ error: 'content is required' });
+      try {
+        const { title, content, category } = req.body;
 
-      const notice = await repo.createNotice({
-        title: title.trim(),
-        content: content.trim(),
-        category: category ?? 'GENERAL',
-        image_url,
-        action_button_text,
-        action_button_link,
-        is_featured,
-        createdBy: req.user.id,
-      });
+        if (!title?.trim()) {
+          return reply.status(400).send({ error: 'title is required' });
+        }
 
-      req.auditOnResponse = {
-        userId: req.user.id,
-        action: 'NOTICE_CREATED',
-        resourceType: 'notice',
-        resourceId: notice.id,
-        details: { title: notice.title, category: notice.category },
-        ...extractRequestInfo(req),
-      };
-      return reply.status(201).send(notice);
+        if (!content?.trim()) {
+          return reply.status(400).send({ error: 'content is required' });
+        }
+
+        const notice = await repo.createNotice({
+          title: title.trim(),
+          content: content.trim(),
+          category: category ?? 'GENERAL',
+          createdBy: req.user.id,
+        });
+
+        req.auditOnResponse = {
+          userId: req.user.id,
+          action: 'NOTICE_CREATED',
+          resourceType: 'notice',
+          resourceId: notice.id,
+          details: {
+            title: notice.title,
+            category: notice.category,
+          },
+          ...extractRequestInfo(req),
+        };
+
+        return reply.status(201).send(notice);
+      } catch (err) {
+        req.log.error({ err }, 'Failed to publish notice');
+
+        return reply.status(500).send({
+          error: 'Failed to publish notice',
+        });
+      }
     }
   );
-
   fastify.post(
     '/notices/ai-analyze',
     {
@@ -181,7 +184,6 @@ async function noticesRoutes(fastify) {
       return reply.send(result);
     }
   );
-
   fastify.patch(
     '/notices/:id',
     {
@@ -306,5 +308,4 @@ async function noticesRoutes(fastify) {
     }
   );
 }
-
 module.exports = noticesRoutes;
