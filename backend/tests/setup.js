@@ -6,7 +6,11 @@ jest.mock('argon2', () => {
     }),
     verify: jest.fn().mockImplementation(async (hash, password) => {
       // Seeded admin password check — accept real argon2 hashes from globalSetup
-      if (password === 'Admin@123' && hash && hash.startsWith('$argon2id$')) {
+      if (
+        password === process.env.SEED_ADMIN_PASSWORD &&
+        hash &&
+        hash.startsWith('$argon2id$')
+      ) {
         return true;
       }
       // Generic mock hash check — accept mocked hash format

@@ -1,10 +1,15 @@
 const pool = require('../../config/db');
+const {
+  MAX_HIERARCHY_DEPTH,
+  MAX_HIERARCHY_ROWS,
+  roleRankSql,
+} = require('../../utils/hierarchy');
 
 async function createDepartment(name, createdBy) {
   try {
     const res = await pool.query(
       'INSERT INTO departments (name, created_by) VALUES ($1,$2) RETURNING *',
-      [name, createdBy]
+      [name.trim(), createdBy]
     );
     return res.rows[0];
   } catch (error) {
@@ -25,7 +30,24 @@ async function getAll() {
   ).rows;
 }
 
-async function getDepartmentTeams(departmentId) {
+async function getById(id) {
+  const { rows } = await pool.query(
+    `SELECT *
+     FROM departments
+     WHERE id = $1
+       AND deleted_at IS NULL`,
+    [id]
+  );
+
+  return rows[0] || null;
+}
+
+async function getDepartmentTeams(departmentId, options = {}) {
+  const hierarchyLimit = Math.min(
+    Math.max(Number(options.hierarchyLimit) || MAX_HIERARCHY_ROWS, 1),
+    MAX_HIERARCHY_ROWS
+  );
+  const cappedHierarchyLimit = hierarchyLimit + 1;
   const { rows } = await pool.query(
     `WITH RECURSIVE leaders AS (
        SELECT id, full_name, role, department_id
@@ -34,14 +56,31 @@ async function getDepartmentTeams(departmentId) {
          AND role IN ('SENIOR_TL', 'TL', 'CAPTAIN')
          AND deleted_at IS NULL
      ), descendants AS (
-       SELECT l.id AS lead_id, u.id AS member_id, u.role AS member_role, 1 AS depth
+       SELECT l.id AS lead_id, u.id AS member_id, u.role AS member_role,
+              1 AS depth, ${roleRankSql('u')} AS structural_rank,
+              ARRAY[l.id, u.id] AS path
        FROM leaders l
-       JOIN users u ON u.manager_id = l.id AND u.deleted_at IS NULL
+       JOIN users u
+         ON u.manager_id = l.id
+        AND u.department_id = l.department_id
+        AND u.deleted_at IS NULL
+        AND u.id <> l.id
        UNION ALL
-       SELECT d.lead_id, u.id, u.role, d.depth + 1
+       SELECT d.lead_id, u.id, u.role, d.depth + 1,
+              ${roleRankSql('u')} AS structural_rank, d.path || u.id
        FROM descendants d
-       JOIN users u ON u.manager_id = d.member_id AND u.deleted_at IS NULL
-       WHERE d.depth < 100
+       JOIN users u
+         ON u.manager_id = d.member_id
+        AND u.department_id = $1
+        AND u.deleted_at IS NULL
+        AND NOT u.id = ANY(d.path)
+       WHERE d.depth < $2
+     ), capped_descendants AS (
+       SELECT lead_id, member_id, member_role, depth, structural_rank
+       FROM descendants
+       LIMIT $3
+     ), mapping_guard AS (
+       SELECT COUNT(*)::int AS mapping_count FROM capped_descendants
      ), department_totals AS (
        SELECT
          COUNT(*) FILTER (WHERE role <> 'ADMIN')::int AS total_members,
@@ -63,74 +102,142 @@ async function getDepartmentTeams(departmentId) {
             CASE WHEN l.role = 'SENIOR_TL' THEN dt.captain_count
                  ELSE COUNT(DISTINCT d.member_id) FILTER (WHERE d.member_role = 'CAPTAIN')::int END AS captain_count,
             CASE WHEN l.role = 'SENIOR_TL' THEN dt.intern_count
-                 ELSE COUNT(DISTINCT d.member_id) FILTER (WHERE d.member_role = 'INTERN')::int END AS intern_count
+                 ELSE COUNT(DISTINCT d.member_id) FILTER (WHERE d.member_role = 'INTERN')::int END AS intern_count,
+            (mg.mapping_count > $4) AS mapping_limit_exceeded
      FROM leaders l
      CROSS JOIN department_totals dt
-     LEFT JOIN descendants d ON d.lead_id = l.id
+     CROSS JOIN mapping_guard mg
+     LEFT JOIN capped_descendants d ON d.lead_id = l.id
      GROUP BY l.id, l.full_name, l.role, dt.total_members, dt.tl_count,
-              dt.captain_count, dt.intern_count
-     ORDER BY CASE l.role WHEN 'SENIOR_TL' THEN 0 WHEN 'TL' THEN 1 WHEN 'CAPTAIN' THEN 2 ELSE 3 END,
-              LOWER(COALESCE(l.full_name, ''))`,
-    [departmentId]
+              dt.captain_count, dt.intern_count, mg.mapping_count
+     ORDER BY ${roleRankSql('l')},
+              LOWER(COALESCE(NULLIF(TRIM(l.full_name), ''), l.id::text)),
+              l.id`,
+    [departmentId, MAX_HIERARCHY_DEPTH, cappedHierarchyLimit, hierarchyLimit]
   );
-  return rows;
-}
-async function deleteDepartment(id, force = false) {
-  const { rows } = await pool.query(
-    `
-    SELECT COUNT(*)::int AS user_count
-    FROM users
-    WHERE department_id = $1
-      AND deleted_at IS NULL
-    `,
-    [id]
-  );
-
-  const userCount = Number(rows[0].user_count);
-
-  if (userCount > 0 && !force) {
-    return {
-      success: false,
-      userCount,
-    };
+  if (rows.some((row) => row.mapping_limit_exceeded)) {
+    const error = new Error('Department hierarchy mapping limit exceeded');
+    error.statusCode = 416;
+    throw error;
   }
 
-  if (force) {
-    await pool.query(
-      `
-      UPDATE users
-      SET department_id = NULL
-      WHERE department_id = $1
-        AND deleted_at IS NULL
-      `,
+  return rows.map(({ mapping_limit_exceeded: _ignored, ...row }) => row);
+}
+async function deleteDepartment(id, confirmedName = null) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query("SET LOCAL lock_timeout = '10s'");
+    await client.query("SET LOCAL statement_timeout = '30s'");
+    const departmentResult = await client.query(
+      `SELECT id,name FROM departments WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`,
       [id]
     );
-  }
-
-  const result = await pool.query(
-    `
-    UPDATE departments
-    SET deleted_at = NOW(),
-        updated_at = NOW()
-    WHERE id = $1
-    RETURNING id
-    `,
-    [id]
-  );
-
-  if (result.rowCount === 0) {
+    const department = departmentResult.rows[0];
+    if (!department) {
+      await client.query('ROLLBACK');
+      return { success: false, notFound: true, userCount: 0 };
+    }
+    const membersResult = await client.query(
+      `SELECT id,role,manager_id FROM users
+       WHERE department_id=$1 AND deleted_at IS NULL AND role <> 'ADMIN' FOR UPDATE`,
+      [id]
+    );
+    const members = membersResult.rows;
+    const roleCounts = members.reduce(
+      (counts, member) => {
+        counts[member.role] = (counts[member.role] || 0) + 1;
+        return counts;
+      },
+      { SENIOR_TL: 0, TL: 0, CAPTAIN: 0, INTERN: 0 }
+    );
+    if (members.length && confirmedName !== department.name) {
+      await client.query('ROLLBACK');
+      return {
+        success: false,
+        confirmationRequired: true,
+        userCount: members.length,
+        roleCounts,
+      };
+    }
+    const memberIds = members.map((member) => member.id);
+    if (memberIds.length) {
+      await client.query(
+        `UPDATE users SET manager_id=NULL,updated_at=NOW()
+         WHERE manager_id=ANY($1::uuid[]) AND NOT (id=ANY($1::uuid[]))`,
+        [memberIds]
+      );
+      await client.query(
+        'DELETE FROM notifications WHERE user_id=ANY($1::uuid[])',
+        [memberIds]
+      );
+      await client.query(
+        'DELETE FROM refresh_tokens WHERE user_id=ANY($1::uuid[])',
+        [memberIds]
+      );
+      await client.query(
+        'DELETE FROM password_reset_tokens WHERE user_id=ANY($1::uuid[])',
+        [memberIds]
+      );
+      await client.query(
+        'DELETE FROM email_verifications WHERE user_id=ANY($1::uuid[])',
+        [memberIds]
+      );
+      await client.query('DELETE FROM ai_usage WHERE user_id=ANY($1::uuid[])', [
+        memberIds,
+      ]);
+      await client.query(
+        'DELETE FROM assessments WHERE user_id=ANY($1::uuid[])',
+        [memberIds]
+      );
+      await client.query(
+        'DELETE FROM attendance_exemptions WHERE user_id=ANY($1::uuid[])',
+        [memberIds]
+      );
+      await client.query(
+        'DELETE FROM meeting_attendees WHERE user_id=ANY($1::uuid[])',
+        [memberIds]
+      );
+      await client.query(
+        'DELETE FROM onboarding_checklists WHERE intern_id=ANY($1::uuid[])',
+        [memberIds]
+      );
+      await client.query(
+        'DELETE FROM proof_submissions WHERE intern_id=ANY($1::uuid[])',
+        [memberIds]
+      );
+      await client.query(
+        'DELETE FROM task_assignments WHERE user_id=ANY($1::uuid[])',
+        [memberIds]
+      );
+      await client.query(
+        `UPDATE users SET email='removed+'||id::text||'@deleted.invalid',
+         full_name='Removed User',phone=NULL,college=NULL,course=NULL,
+         year_of_study=NULL,position=NULL,internship_domain=NULL,
+         offer_letter_url=NULL,location=NULL,notes=NULL,avatar_url=NULL,
+         intern_code=NULL,manager_id=NULL,department_id=NULL,suspended=TRUE,
+         deleted_at=NOW(),updated_at=NOW() WHERE id=ANY($1::uuid[])`,
+        [memberIds]
+      );
+    }
+    await client.query(
+      `UPDATE departments SET deleted_at=NOW(),updated_at=NOW() WHERE id=$1`,
+      [id]
+    );
+    await client.query('COMMIT');
     return {
-      success: false,
-      userCount: 0,
+      success: true,
+      userCount: members.length,
+      roleCounts,
+      departmentName: department.name,
     };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
   }
-
-  return {
-    success: true,
-    userCount,
-  };
 }
-
 async function handoverSeniorTl(
   departmentId,
   outgoingLeadId,
@@ -247,9 +354,11 @@ async function handoverSeniorTl(
     client.release();
   }
 }
+
 module.exports = {
   createDepartment,
   getAll,
+  getById,
   getDepartmentTeams,
   deleteDepartment,
   handoverSeniorTl,

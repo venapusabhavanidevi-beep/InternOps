@@ -11,8 +11,13 @@ activateTestDatabase();
 const argon2 = require('argon2');
 const pool = require('../src/config/db');
 
-const SEEDED_ADMIN_EMAIL = 'admin@internops.com';
-const SEEDED_ADMIN_PASSWORD = 'Admin@123';
+const SEEDED_ADMIN_EMAIL = process.env.SEED_ADMIN_EMAIL;
+const SEEDED_ADMIN_PASSWORD = process.env.SEED_ADMIN_PASSWORD;
+if (!SEEDED_ADMIN_EMAIL || !SEEDED_ADMIN_PASSWORD) {
+  throw new Error(
+    'SEED_ADMIN_EMAIL and SEED_ADMIN_PASSWORD are required for integration tests'
+  );
+}
 
 module.exports = async function globalTeardown() {
   try {

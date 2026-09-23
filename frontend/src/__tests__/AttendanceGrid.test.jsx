@@ -82,7 +82,7 @@ describe('attendance grid contracts', () => {
     expect(usersRepository.indexOf('ORDER BY')).toBeLessThan(
       usersRepository.indexOf('LIMIT $')
     );
-    expect(attendanceRoutes).toContain("WHEN 'SENIOR_TL' THEN 1");
+    expect(usersRepository).toContain("WHEN 'SENIOR_TL' THEN 1");
   });
 
   test('sticky identity columns are opaque and isolated', () => {
@@ -113,8 +113,11 @@ describe('attendance grid contracts', () => {
     expect(sheet).toContain('LIFECYCLE_BADGE');
     expect(sheet).toContain('DISCONTINUED');
     expect(sheet).toMatch(/>\s*Status\s*<\/th>/);
-    expect(attendance).toContain('attendance-detail-csv');
-    expect(attendance).toContain("responseType: 'blob'");
+    expect(sheet).toContain(
+      "import DownloadDataMenu from '../DownloadDataMenu'"
+    );
+    expect(sheet).toContain('exportTable({');
+    expect(sheet).toContain("sheetName: 'Attendance'");
   });
   test('month selection, JOINED timeline, and dark lifecycle badges', () => {
     expect(attendance).toContain('monthRange(selectedMonth, today)');
@@ -170,6 +173,36 @@ describe('attendance grid contracts', () => {
     expect(monthPicker).toContain('disabled={unavailable}');
     expect(sheet).toContain(
       "import CustomMonthPicker from '../CustomMonthPicker'"
+    );
+  });
+  test('restricts attendance month selection to months with records', () => {
+    const repository = fs.readFileSync(
+      path.resolve(
+        __dirname,
+        '../../../backend/src/modules/attendance/repository.js'
+      ),
+      'utf8'
+    );
+    const monthPicker = fs.readFileSync(
+      path.resolve(__dirname, '../components/CustomMonthPicker.jsx'),
+      'utf8'
+    );
+    expect(repository).toContain("TO_CHAR(a.date, 'YYYY-MM') AS month");
+    expect(repository).toContain('a.deleted_at IS NULL');
+    expect(repository).toContain('available_months: availableMonths');
+    expect(sheet).toContain('allowedMonths={data?.available_months ?? []}');
+    expect(sheet).toContain(
+      'No attendance records are available for this team.'
+    );
+    expect(attendance).toContain('sheetData?.available_months || []');
+    expect(attendance).toContain(
+      'sheetAvailableMonths[sheetAvailableMonths.length - 1]'
+    );
+    expect(monthPicker).toContain(
+      'Array.isArray(allowedMonths) ? new Set(allowedMonths) : null'
+    );
+    expect(monthPicker).toContain(
+      'if (allowed && !allowedYears.length) return;'
     );
   });
   test('waits for month popup positioning before display', () => {

@@ -16,7 +16,7 @@ async function routes(fastify) {
     '/preview',
     {
       config: { rateLimit: { max: 5, timeWindow: '1 minute' } },
-      preHandler: [auth, rbac('ADMIN', 'SENIOR_TL')],
+      preHandler: [auth, rbac('ADMIN', 'SENIOR_TL', 'TL')],
       schema: {
         tags: ['Workbook Imports'],
         description:
@@ -92,7 +92,7 @@ async function routes(fastify) {
     '/execute',
     {
       config: { rateLimit: { max: 2, timeWindow: '5 minutes' } },
-      preHandler: [auth, rbac('ADMIN', 'SENIOR_TL')],
+      preHandler: [auth, rbac('ADMIN', 'SENIOR_TL', 'TL')],
       schema: {
         tags: ['Workbook Imports'],
         description:
@@ -123,9 +123,22 @@ async function routes(fastify) {
     },
     async (request, reply) => {
       const uploads = {};
+      let attendanceResolutions = {};
       for await (const part of request.parts({
         limits: { fileSize: MAX_WORKBOOK_SIZE, files: 2 },
       })) {
+        if (part.type === 'field') {
+          if (part.fieldname === 'attendanceResolutions') {
+            try {
+              attendanceResolutions = JSON.parse(String(part.value || '{}'));
+            } catch {
+              return reply
+                .status(400)
+                .send({ error: 'Attendance resolutions must be valid JSON' });
+            }
+          }
+          continue;
+        }
         if (part.type !== 'file') continue;
         if (!['workbook', 'emailWorkbook'].includes(part.fieldname)) {
           part.file.resume();
@@ -147,6 +160,7 @@ async function routes(fastify) {
             requesterId: request.user.id,
             requesterRole: request.user.role,
             requesterDepartmentId: request.user.departmentId,
+            attendanceResolutions,
           }
         );
       } catch (error) {

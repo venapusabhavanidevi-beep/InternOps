@@ -14,11 +14,12 @@
   "scripts": {
     "test": "npm run test --workspace=backend",
     "dev": "concurrently \"npm run dev --workspace=frontend\" \"npm run dev --workspace=backend\" \"cd ai-service && uv run uvicorn app.main:app --reload\"",
+    "dev:app": "concurrently \"npm run dev --workspace=backend\" \"npm run dev --workspace=frontend\"",
     "lint": "npm run lint --workspaces --if-present",
     "format": "prettier --write .",
     "clean": "rimraf node_modules && npm run clean --workspaces --if-present",
     "reinstall": "npm run clean && npm install",
-    "prepare": "husky || true",
+    "prepare": "husky || exit 0",
     "prompt-test": "pytest ai-service/app/tests"
   },
   "workspaces": [
@@ -52,6 +53,8 @@
   },
   "dependencies": {
     "@google/genai": "^2.16.0",
+    "@sentry/react": "^10.73.0",
+    "@sentry/conventions": "^0.16.0",
     "bullmq": "^6.1.1",
     "color-name": "^2.1.1",
     "require-directory": "^2.1.1",

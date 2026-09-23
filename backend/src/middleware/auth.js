@@ -1,13 +1,10 @@
 const { verifyAccessToken } = require('../utils/tokens');
-const {
-  isAccessTokenBlacklisted,
-  blacklistAccessToken,
-} = require('../config/redis');
 const authRepository = require('../modules/auth/repository');
 const PASSWORD_CHANGE_ALLOWED_ROUTES = new Set([
   'GET /api/v1/users/me',
   'PATCH /api/v1/users/me/password',
   'POST /api/v1/auth/logout',
+  'POST /api/v1/auth/impersonation/exit',
 ]);
 function requestRouteKey(request) {
   const route = request.routeOptions?.url || request.routerPath || '';
@@ -24,7 +21,7 @@ async function authMiddleware(request, reply) {
   try {
     const decoded = verifyAccessToken(auth.split(' ')[1]);
 
-    if (await isAccessTokenBlacklisted(decoded.jti)) {
+    if (await authRepository.isAccessTokenRevoked(decoded.jti)) {
       return reply.status(401).send({
         error: 'Token revoked',
       });
@@ -45,7 +42,20 @@ async function authMiddleware(request, reply) {
       jti: decoded.jti,
       exp: decoded.exp,
       mustChangePassword,
+      impersonatedBy: decoded.impersonatedBy || null,
+      impersonationReadOnly: Boolean(decoded.impersonationReadOnly),
     });
+    if (
+      decoded.impersonationReadOnly &&
+      !['GET', 'HEAD', 'OPTIONS'].includes(request.method.toUpperCase()) &&
+      requestRouteKey(request) !== 'POST /api/v1/auth/impersonation/exit'
+    ) {
+      return reply.status(403).send({
+        error:
+          'This action is unavailable while viewing InternOps as another user.',
+        code: 'IMPERSONATION_READ_ONLY',
+      });
+    }
     if (
       mustChangePassword &&
       !PASSWORD_CHANGE_ALLOWED_ROUTES.has(requestRouteKey(request))
@@ -55,7 +65,8 @@ async function authMiddleware(request, reply) {
         code: 'PASSWORD_CHANGE_REQUIRED',
       });
     }
-  } catch {
+  } catch (err) {
+    request.log.error(err, 'Auth error');
     return reply.status(401).send({ error: 'Invalid token' });
   }
 }

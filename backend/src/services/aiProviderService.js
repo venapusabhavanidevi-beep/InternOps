@@ -1,6 +1,11 @@
 const crypto = require('crypto');
 const { LRUCache } = require('lru-cache');
-const { GoogleGenAI } = require('@google/genai');
+let GoogleGenAI;
+try {
+  ({ GoogleGenAI } = require('@google/genai'));
+} catch (e) {
+  // Optional dependency
+}
 const config = require('../config');
 const { getRedisClient } = require('../config/redis');
 const { safeParseJSON } = require('../utils/promptCleaner');
@@ -14,6 +19,9 @@ const COOLDOWN_MS = Number(
 const CACHE_TTL_MS = Number(process.env.AI_CACHE_TTL_MS || 5 * 60 * 1000);
 const CACHE_MAX_ENTRIES = Number(process.env.AI_CACHE_MAX_ENTRIES || 500);
 
+// Maximum allowed size for AI provider responses.
+// We use a 5MB default cap because some payloads (e.g. base64 image generation via FastAPI)
+// can exceed the previous 2MB limit. This protects against stream-amplification OOM attacks.
 const MAX_AI_RESPONSE_BYTES = Number(
   process.env.AI_MAX_RESPONSE_BYTES || 5 * 1024 * 1024
 );
@@ -359,8 +367,9 @@ async function callDeepSeek(messages) {
 async function callGemini(messages) {
   const prompt = buildPrompt(messages);
   const key = config.ai.geminiKey || '';
-  const modelName = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+  const modelName = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
 
+  if (!GoogleGenAI) throw new Error('GoogleGenAI dependency not loaded');
   const ai = new GoogleGenAI({ apiKey: key });
   const response = await ai.models.generateContent({
     model: modelName,
@@ -409,13 +418,17 @@ async function callHuggingFace(messages) {
   return text;
 }
 
-async function callFastAPI(messages) {
+async function callFastAPI(messages, authorization) {
   const baseUrl = config.ai.fastapiUrl || 'http://localhost:8000';
+  const headers = {
+    'Content-Type': 'application/json',
+  };
+  if (authorization) {
+    headers['Authorization'] = authorization;
+  }
   const response = await fetchWithTimeout(`${baseUrl}/ai/chat`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
+    headers,
     body: JSON.stringify({ messages }),
   });
 
@@ -427,12 +440,13 @@ async function callFastAPI(messages) {
   return data.content;
 }
 
-async function callFastAPIImage(prompt) {
+async function callFastAPIImage(prompt, authorization) {
   const baseUrl = config.ai.fastapiUrl || 'http://localhost:8000';
   const response = await fetchWithTimeout(`${baseUrl}/ai/generate-image`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
+      Authorization: authorization,
     },
     body: JSON.stringify({ prompt }),
   });
@@ -453,8 +467,8 @@ async function callFastAPIImage(prompt) {
   return data;
 }
 
-async function generateAIImage({ prompt }) {
-  return callFastAPIImage(prompt);
+async function generateAIImage({ prompt, authorization }) {
+  return callFastAPIImage(prompt, authorization);
 }
 
 const providerRegistry = {
@@ -498,7 +512,7 @@ function createFallbackResponse(errors) {
   };
 }
 
-async function generateAIResponse({ userId, messages }) {
+async function generateAIResponse({ userId, messages, authorization }) {
   const safeMessages = Array.isArray(messages) ? messages : [];
   const sanitizedMessages = safeMessages.slice(-16).map((m) => ({
     role: m.role,
@@ -542,7 +556,7 @@ async function generateAIResponse({ userId, messages }) {
     }
 
     try {
-      const content = await provider.call(sanitizedMessages);
+      const content = await provider.call(sanitizedMessages, authorization);
 
       recordSuccess(providerName);
 

@@ -92,8 +92,8 @@ scenarios:
           headers:
             'X-CSRF-Token': '{{ csrfToken }}'
           json:
-            email: 'admin@internops.com'
-            password: 'Admin@123'
+            email: '{{ $processEnvironment.LOAD_TEST_ADMIN_EMAIL }}'
+            password: '{{ $processEnvironment.LOAD_TEST_ADMIN_PASSWORD }}'
           capture:
             - json: '$.accessToken'
               as: 'accessToken'

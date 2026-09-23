@@ -29,23 +29,96 @@ import {
   GitPullRequest,
   Menu,
   X,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Inbox,
+  Activity,
 } from 'lucide-react';
 
-import { useState, useEffect, useRef, useMemo, useCallback, memo } from 'react';
+import {
+  useState,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useMemo,
+  useCallback,
+  memo,
+  lazy,
+  Suspense,
+} from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import api from '../lib/axios';
+import { resolveUploadUrl } from '../lib/uploadUrl';
 import { connectSocket, disconnectSocket } from '../lib/socket';
+import useBackgroundCacheInvalidation from '../hooks/useBackgroundCacheInvalidation';
 import { UserAvatar, ConfirmationModal } from '../components/ui';
 import useAuthStore from '../store/auth';
 import useFeatureFlagsStore from '../store/featureFlags';
 import { QUERY_KEYS } from '../constants/queryKeys';
 import { ROLE_LABEL } from '../constants/roles';
-import FloatingChatbot from '../components/FloatingChatbot';
+const FloatingChatbot = lazy(() => import('../components/FloatingChatbot'));
+import RouteRefreshSkeleton from '../components/loading/RouteRefreshSkeleton';
+import RouteInitialLoading from '../components/loading/RouteInitialLoading';
 
+function safeStorageGet(key) {
+  try {
+    if (typeof window === 'undefined') return null;
+
+    const storage = window.localStorage;
+
+    return typeof storage?.getItem === 'function' ? storage.getItem(key) : null;
+  } catch {
+    return null;
+  }
+}
+
+function safeStorageSet(key, value) {
+  try {
+    if (typeof window === 'undefined') return;
+
+    const storage = window.localStorage;
+
+    if (typeof storage?.setItem === 'function') {
+      storage.setItem(key, value);
+    }
+  } catch {
+    // Storage unavailable or blocked.
+  }
+}
+
+function safeSessionStorageGet(key) {
+  try {
+    if (typeof window === 'undefined') return null;
+
+    const storage = window.sessionStorage;
+
+    return typeof storage?.getItem === 'function' ? storage.getItem(key) : null;
+  } catch {
+    return null;
+  }
+}
+
+function safeSessionStorageSet(key, value) {
+  try {
+    if (typeof window === 'undefined') return;
+
+    const storage = window.sessionStorage;
+
+    if (typeof storage?.setItem === 'function') {
+      storage.setItem(key, value);
+    }
+  } catch {
+    // Session storage unavailable or blocked.
+  }
+}
+
+const FLOATING_CHATBOT_ROLES = ['ADMIN', 'SENIOR_TL', 'TL'];
 const MANAGER_ROLES = ['ADMIN', 'SENIOR_TL', 'TL', 'CAPTAIN'];
 const ADMIN_AND_SENIOR_TL_ROLES = ['ADMIN', 'SENIOR_TL'];
 const ADMIN_ONLY_ROLES = ['ADMIN'];
+const HR_ROLES = ['ADMIN', 'HR'];
+const DIRECTORY_ROLES = ['ADMIN', 'SENIOR_TL', 'TL'];
 
 const nav = [
   { path: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
@@ -56,10 +129,17 @@ const nav = [
     allowedRoles: MANAGER_ROLES,
   },
   {
+    path: '/analytics',
+    label: 'Analytics',
+    icon: BarChart2,
+    allowedRoles: ADMIN_AND_SENIOR_TL_ROLES,
+    featureFlag: 'ADVANCED_ANALYTICS',
+  },
+  {
     path: '/hr',
     label: 'HR',
     icon: BriefcaseBusiness,
-    allowedRoles: ADMIN_ONLY_ROLES,
+    allowedRoles: HR_ROLES,
   },
   {
     path: '/attendance',
@@ -82,7 +162,25 @@ const nav = [
   },
   { path: '/notifications', label: 'Notifications', icon: Bell },
   { path: '/profile', label: 'Profile', icon: User },
+  { path: '/requests', label: 'Requests', icon: Inbox },
   { path: '/sessions', label: 'Sessions', icon: Shield },
+  {
+    path: '/internops',
+    label: 'InternOps',
+    icon: Building,
+    allowedRoles: ADMIN_AND_SENIOR_TL_ROLES,
+  },
+  {
+    path: '/performance-intelligence',
+    label: 'AI Performance Review',
+    icon: Sparkles,
+  },
+  {
+    path: '/risk-intelligence',
+    label: 'Risk Intelligence',
+    icon: Activity,
+    allowedRoles: MANAGER_ROLES,
+  },
   {
     path: '/reports',
     label: 'Reports',
@@ -94,13 +192,6 @@ const nav = [
     label: 'Report Templates',
     icon: FileText,
     allowedRoles: ADMIN_AND_SENIOR_TL_ROLES,
-  },
-  {
-    path: '/analytics',
-    label: 'Analytics',
-    icon: BarChart2,
-    allowedRoles: ADMIN_AND_SENIOR_TL_ROLES,
-    featureFlag: 'ADVANCED_ANALYTICS',
   },
   {
     path: '/exports',
@@ -121,13 +212,13 @@ const adminNav = [
     path: '/admin',
     label: 'Users',
     icon: Settings,
-    allowedRoles: ADMIN_ONLY_ROLES,
+    allowedRoles: DIRECTORY_ROLES,
   },
   {
     path: '/departments',
     label: 'Departments',
     icon: Building,
-    allowedRoles: ADMIN_ONLY_ROLES,
+    allowedRoles: DIRECTORY_ROLES,
   },
   {
     path: '/audit',
@@ -190,15 +281,48 @@ const adminNav = [
 
 const FULL_LOGO_SRC = '/UptoSkills.webp';
 const MINI_LOGO_SRC = '/Uptoskills_log_fevicon.png';
+const COORDINATED_LOADING_ROUTES = new Set([
+  '/admin',
+  '/audit',
+  '/dashboard',
+  '/departments',
+  '/team',
+  '/hr',
+  '/profile',
+  '/quick-generate',
+  '/certificates',
+  '/bulk-generate',
+  '/canva-templates',
+  '/feature-flags',
+  '/github-sync',
+  '/tasks',
+  '/notifications',
+  '/sessions',
+  '/internops',
+  '/performance-intelligence',
+  '/risk-intelligence',
+  '/reports',
+  '/report-templates',
+  '/exports',
+  '/notices',
+]);
+const COORDINATED_LOADING_ROUTE_PATTERNS = [
+  /^\/departments\/[^/]+\/projects$/,
+  /^\/departments\/[^/]+\/projects\/[^/]+$/,
+  /^\/admin\/departments\/[^/]+\/attendance$/,
+  /^\/admin\/departments\/[^/]+\/ratings$/,
+  /^\/admin\/departments\/[^/]+\/tasks$/,
+];
 
-function canShowNavItem(item, role, flags) {
+function canShowNavItem(item, role, flags, flagsLoaded) {
   if (item.excludedRoles && item.excludedRoles.includes(role)) return false;
   if (!item.allowedRoles) {
-    if (item.featureFlag) return flags[item.featureFlag] === true;
+    if (item.featureFlag)
+      return !flagsLoaded || flags[item.featureFlag] === true;
     return true;
   }
   if (!item.allowedRoles.includes(role)) return false;
-  if (item.featureFlag) return flags[item.featureFlag] === true;
+  if (item.featureFlag) return !flagsLoaded || flags[item.featureFlag] === true;
   return true;
 }
 
@@ -220,9 +344,13 @@ const NavLink = memo(({ n, active, collapsed, onLinkClick }) => {
         }`}
     >
       <Icon className="w-5 h-5 shrink-0" strokeWidth={active ? 2.5 : 2} />
-      {!collapsed && <span className="whitespace-nowrap">{n.label}</span>}
+      {!collapsed && (
+        <span className="min-w-0 flex-1 truncate whitespace-nowrap">
+          {n.label}
+        </span>
+      )}
       {!collapsed && active && (
-        <span className="ml-auto w-1.5 h-1.5 rounded-full bg-indigo-600" />
+        <span className="ml-2 h-1.5 w-1.5 shrink-0 rounded-full bg-indigo-600" />
       )}
       {collapsed && active && (
         <span className="absolute right-1.5 w-1.5 h-6 rounded-full bg-white/80" />
@@ -231,22 +359,63 @@ const NavLink = memo(({ n, active, collapsed, onLinkClick }) => {
   );
 });
 NavLink.displayName = 'NavLink';
+function AccountAvatar({ loading, name, email, src }) {
+  if (loading) {
+    return (
+      <span
+        aria-label="Loading account avatar"
+        className="block h-9 w-9 shrink-0 animate-pulse rounded-full border border-white/30 bg-white/15 dark:border-slate-700 dark:bg-slate-700/70"
+      />
+    );
+  }
+  return <UserAvatar name={name} email={email} src={src} text="text-xs" />;
+}
 
+let authHydrationPromise = null;
+function waitForAuthHydration() {
+  if (useAuthStore.getState().hydrated) return Promise.resolve();
+  if (!authHydrationPromise) {
+    authHydrationPromise = new Promise((resolve) => {
+      const unsubscribe = useAuthStore.subscribe((state) => {
+        if (!state.hydrated) return;
+        unsubscribe();
+        authHydrationPromise = null;
+        resolve();
+      });
+    });
+  }
+  return authHydrationPromise;
+}
+function AuthHydrationGate({ children }) {
+  const hydrated = useAuthStore((state) => state.hydrated);
+  if (!hydrated) throw waitForAuthHydration();
+  return children;
+}
 export default function DashboardLayout() {
   const loc = useLocation();
   const navigate = useNavigate();
+  const previousPathRef = useRef(loc.pathname);
+  const [animatedRoutePath, setAnimatedRoutePath] = useState(null);
+  const shouldAnimateRoute = animatedRoutePath === loc.pathname;
   const user = useAuthStore((s) => s.user);
+  const hydrated = useAuthStore((s) => s.hydrated);
   const logout = useAuthStore((s) => s.logout);
+  const impersonation = useAuthStore((s) => s.impersonation);
+  const exitImpersonation = useAuthStore((s) => s.exitImpersonation);
   const accessToken = useAuthStore((s) => s.accessToken);
   const queryClient = useQueryClient();
 
+  const socket =
+    accessToken && !user?.mustChangePassword
+      ? connectSocket(accessToken)
+      : null;
+  useBackgroundCacheInvalidation(socket);
+
   useEffect(() => {
-    if (!accessToken) return undefined;
+    if (!accessToken || user?.mustChangePassword) return undefined;
 
     const socket = connectSocket(accessToken);
 
-    // Live-update the bell badge the instant a new notification arrives,
-    // instead of waiting for the next 30s poll (#1753).
     const handleNotificationReceived = (payload) => {
       if (typeof payload?.unreadCount === 'number') {
         queryClient.setQueryData(['notifications', 'unread-count'], {
@@ -254,8 +423,6 @@ export default function DashboardLayout() {
         });
       }
 
-      // Keep any mounted notifications list fresh too, without refetching
-      // the unread-count query we just updated optimistically above.
       queryClient.invalidateQueries({
         predicate: (query) =>
           query.queryKey[0] === 'notifications' &&
@@ -269,67 +436,163 @@ export default function DashboardLayout() {
       socket?.off('notification-received', handleNotificationReceived);
       disconnectSocket();
     };
-  }, [accessToken, queryClient]);
+  }, [accessToken, queryClient, user?.mustChangePassword]);
 
   const role = user?.role;
+  const canUseFloatingChatbot = FLOATING_CHATBOT_ROLES.includes(role);
   const flags = useFeatureFlagsStore((s) => s.flags);
+  const flagsLoaded = useFeatureFlagsStore((s) => s.loaded);
   const SIDEBAR_KEY = 'sidebar_scroll';
   const sidebarNavRef = useRef(null);
+  const mainContentRef = useRef(null);
 
   const [collapsed, setCollapsed] = useState(
-    () => localStorage.getItem('sidebar') === 'collapsed'
+    () => safeStorageGet('sidebar') === 'collapsed'
   );
-  const [dark, setDark] = useState(
-    () => localStorage.getItem('theme') === 'dark'
-  );
+
+  const [dark, setDark] = useState(() => safeStorageGet('theme') === 'dark');
+
   const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
+  const [endingUserView, setEndingUserView] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
 
-  const { data: me } = useQuery({
+  const { data: me, isFetched: profileFetched } = useQuery({
     queryKey: QUERY_KEYS.USER_PROFILE,
     queryFn: () => api.get('/users/me').then((r) => r.data),
+    enabled: !!accessToken,
   });
+  const isDepartmentScopedRole = ['SENIOR_TL', 'TL'].includes(role);
+  const { data: scopedDepartments = [] } = useQuery({
+    queryKey: ['departments', 'sidebar', role],
+    queryFn: () => api.get('/departments').then((r) => r.data || []),
+    enabled:
+      !!accessToken && isDepartmentScopedRole && !user?.mustChangePassword,
+  });
+  const assignedDepartment = scopedDepartments[0] || null;
+  const departmentLabelStorageKey = user?.id
+    ? `sidebar-department-label:${user.id}`
+    : null;
+
+  const storedDepartmentLabel = departmentLabelStorageKey
+    ? safeStorageGet(departmentLabelStorageKey)
+    : null;
+
+  useEffect(() => {
+    if (departmentLabelStorageKey && assignedDepartment?.name) {
+      safeStorageSet(
+        departmentLabelStorageKey,
+        `${assignedDepartment.name} Department`
+      );
+    }
+  }, [assignedDepartment?.name, departmentLabelStorageKey]);
 
   const { data: unreadData } = useQuery({
     queryKey: ['notifications', 'unread-count'],
     queryFn: () => api.get('/notifications/unread-count').then((r) => r.data),
     refetchInterval: 30000,
     refetchIntervalInBackground: false,
-    enabled: !!user,
+    enabled: !!accessToken && !!user && !user?.mustChangePassword,
   });
 
   const unreadCount = unreadData?.unread || 0;
 
-  const displayName = me?.full_name || user?.fullName || user?.email;
-  const avatarUrl = me?.avatar_url || null;
+  const displayName = me?.full_name || user?.full_name || user?.fullName || '';
+  const displayNameReady = Boolean(displayName);
+  const profileAvatar = profileFetched ? me?.avatar_url : user?.avatar_url;
+  const avatarPending =
+    !profileAvatar && (!hydrated || (!!accessToken && !profileFetched));
+  const defaultAvatar =
+    !avatarPending && role === 'ADMIN' ? '/admin-default-avatar.svg' : null;
+  const avatarUrl = resolveUploadUrl(profileAvatar || defaultAvatar);
 
   useEffect(() => {
-    localStorage.setItem('sidebar', collapsed ? 'collapsed' : 'open');
+    safeStorageSet('sidebar', collapsed ? 'collapsed' : 'open');
   }, [collapsed]);
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', dark);
-    localStorage.setItem('theme', dark ? 'dark' : 'light');
+    safeStorageSet('theme', dark ? 'dark' : 'light');
   }, [dark]);
 
   const visibleNav = useMemo(
-    () => nav.filter((item) => canShowNavItem(item, role, flags)),
-    [role, flags]
+    () => nav.filter((item) => canShowNavItem(item, role, flags, flagsLoaded)),
+    [role, flags, flagsLoaded]
   );
 
   const visibleAdminNav = useMemo(
-    () => adminNav.filter((item) => canShowNavItem(item, role, flags)),
-    [role, flags]
+    () =>
+      adminNav
+        .filter((item) => canShowNavItem(item, role, flags, flagsLoaded))
+        .map((item) => {
+          if (item.path !== '/departments' || !isDepartmentScopedRole) {
+            return item;
+          }
+
+          return {
+            ...item,
+            path: assignedDepartment?.id
+              ? `/departments/${assignedDepartment.id}/projects`
+              : '/departments',
+            label: assignedDepartment?.name
+              ? `${assignedDepartment.name} Department`
+              : storedDepartmentLabel || 'Department',
+          };
+        }),
+    [
+      assignedDepartment,
+      flags,
+      flagsLoaded,
+      isDepartmentScopedRole,
+      role,
+      storedDepartmentLabel,
+    ]
   );
 
   const allItems = [...visibleNav, ...visibleAdminNav];
 
-  const current = allItems.find((n) => n.path === loc.pathname) || {
-    label: 'Dashboard',
-  };
+  const isProjectDetailRoute = /^\/departments\/[^/]+\/projects\/[^/]+$/.test(
+    loc.pathname
+  );
+  const departmentProjectsMatch = loc.pathname.match(
+    /^\/departments\/([^/]+)\/projects$/
+  );
+  const current = (() => {
+    if (isProjectDetailRoute) return { label: 'Project Detail' };
+
+    if (departmentProjectsMatch) {
+      return {
+        label:
+          allItems.find(
+            (item) =>
+              item.path ===
+              `/departments/${departmentProjectsMatch[1]}/projects`
+          )?.label || 'Department',
+      };
+    }
+
+    const nestedDepartmentPageMatch = loc.pathname.match(
+      /^\/admin\/departments\/[^/]+\/(attendance|ratings|tasks)$/
+    );
+
+    if (nestedDepartmentPageMatch) {
+      return {
+        label:
+          nestedDepartmentPageMatch[1].charAt(0).toUpperCase() +
+          nestedDepartmentPageMatch[1].slice(1),
+      };
+    }
+
+    return (
+      allItems.find(
+        (n) =>
+          n.path === loc.pathname ||
+          (n.path !== '/' && loc.pathname.startsWith(`${n.path}/`))
+      ) || { label: 'Dashboard' }
+    );
+  })();
 
   useEffect(() => {
-    const savedScroll = Number(sessionStorage.getItem(SIDEBAR_KEY) || 0);
+    const savedScroll = Number(safeSessionStorageGet(SIDEBAR_KEY) || 0);
 
     requestAnimationFrame(() => {
       if (sidebarNavRef.current) {
@@ -340,7 +603,7 @@ export default function DashboardLayout() {
 
   const saveSidebarScroll = useCallback(() => {
     if (sidebarNavRef.current) {
-      sessionStorage.setItem(
+      safeSessionStorageSet(
         SIDEBAR_KEY,
         String(sidebarNavRef.current.scrollTop)
       );
@@ -348,10 +611,39 @@ export default function DashboardLayout() {
     setMobileOpen(false);
   }, []);
 
+  const handleExitUserView = async () => {
+    if (endingUserView) return;
+    setEndingUserView(true);
+    try {
+      await api.post(
+        '/auth/impersonation/exit',
+        {},
+        { _suppressGlobalError: true }
+      );
+    } catch {
+      // The local admin session is still restored even if audit delivery fails.
+    } finally {
+      exitImpersonation();
+      queryClient.clear();
+      setEndingUserView(false);
+      navigate('/team', { replace: true });
+    }
+  };
   const handleLogout = () => {
     logout();
     navigate('/login');
   };
+  useLayoutEffect(() => {
+    if (mainContentRef.current) {
+      mainContentRef.current.scrollTo({ top: 0, left: 0, behavior: 'auto' });
+    }
+  }, [loc.pathname]);
+  useLayoutEffect(() => {
+    if (previousPathRef.current !== loc.pathname) {
+      setAnimatedRoutePath(loc.pathname);
+      previousPathRef.current = loc.pathname;
+    }
+  }, [loc.pathname]);
 
   return (
     <div className="flex h-screen bg-gradient-to-br from-slate-50 via-white to-indigo-50/60 dark:from-slate-950 dark:via-slate-950 dark:to-slate-900 text-slate-900 dark:text-white">
@@ -414,14 +706,16 @@ export default function DashboardLayout() {
             <>
               {!collapsed && (
                 <p className="px-3 pt-5 pb-1.5 text-[11px] uppercase tracking-[0.18em] text-indigo-300/90 font-extrabold">
-                  Admin
+                  {role === 'ADMIN' ? 'ADMIN' : 'MANAGEMENT'}
                 </p>
               )}
               {collapsed && (
                 <div className="my-3 mx-3 border-t border-white/10" />
               )}
               {visibleAdminNav.map((n) => {
-                const isDeptNav = n.path === '/departments';
+                const isDeptNav =
+                  n.path === '/departments' ||
+                  /^\/departments\/[^/]+\/projects$/.test(n.path);
                 const deptMatch = loc.pathname.match(
                   /\/(?:admin\/)?departments\/([^/]+)/
                 );
@@ -431,7 +725,13 @@ export default function DashboardLayout() {
                   <div key={n.path} className="space-y-1">
                     <NavLink
                       n={n}
-                      active={loc.pathname === n.path}
+                      active={
+                        loc.pathname === n.path ||
+                        (isDeptNav &&
+                          /^\/(?:admin\/)?departments\/[^/]+/.test(
+                            loc.pathname
+                          ))
+                      }
                       collapsed={collapsed}
                       onLinkClick={saveSidebarScroll}
                     />
@@ -499,18 +799,25 @@ export default function DashboardLayout() {
           <div
             className={`rounded-3xl border border-white/10 bg-white/10 backdrop-blur-xl flex items-center shadow-lg shadow-indigo-950/20 ${collapsed ? 'justify-center p-2.5' : 'gap-3 p-3'}`}
           >
-            <UserAvatar
+            <AccountAvatar
+              loading={avatarPending}
               name={displayName}
               email={user?.email}
               src={avatarUrl}
-              text="text-xs"
             />
             {!collapsed && (
               <>
                 <div className="min-w-0 flex-1">
-                  <p className="text-sm font-extrabold truncate">
-                    {displayName}
-                  </p>
+                  {displayNameReady ? (
+                    <p className="text-sm font-extrabold truncate">
+                      {displayName}
+                    </p>
+                  ) : (
+                    <span
+                      aria-label="Loading account name"
+                      className="block h-4 w-28 max-w-full animate-pulse rounded-lg bg-white/20"
+                    />
+                  )}
                   <p className="text-[11px] text-indigo-200 truncate">
                     {ROLE_LABEL[role] || role}
                   </p>
@@ -551,8 +858,14 @@ export default function DashboardLayout() {
             <button
               onClick={() => setCollapsed((c) => !c)}
               className="hidden md:flex w-10 h-10 rounded-2xl hover:bg-slate-100 dark:hover:bg-slate-800 items-center justify-center text-slate-600 dark:text-slate-300 transition font-extrabold"
+              aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+              title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
             >
-              {collapsed ? '»' : '«'}
+              {collapsed ? (
+                <PanelLeftOpen className="w-5 h-5" />
+              ) : (
+                <PanelLeftClose className="w-5 h-5" />
+              )}
             </button>
             <div className="hidden sm:block">
               <p className="text-xs text-slate-400 dark:text-slate-500 font-bold uppercase tracking-wider">
@@ -599,17 +912,61 @@ export default function DashboardLayout() {
               onClick={saveSidebarScroll}
               className="rounded-full hover:scale-105 transition"
             >
-              <UserAvatar
+              <AccountAvatar
+                loading={avatarPending}
                 name={displayName}
                 email={user?.email}
                 src={avatarUrl}
-                text="text-xs"
               />
             </Link>
           </div>
         </header>
-        <main className="flex-1 overflow-auto p-5 sm:p-6">
-          <Outlet />
+        {impersonation && (
+          <div
+            className="flex min-h-14 flex-wrap items-center justify-between gap-3 border-b border-amber-300 bg-amber-50 px-4 py-2.5 text-amber-950 dark:border-amber-700 dark:bg-amber-950/60 dark:text-amber-100 sm:px-6"
+            role="status"
+          >
+            <div className="min-w-0">
+              <p className="text-sm font-extrabold">
+                Viewing InternOps as {displayName || user?.email}
+              </p>
+              <p className="truncate text-xs">
+                Read-only admin troubleshooting view
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={handleExitUserView}
+              disabled={endingUserView}
+              className="rounded-xl bg-amber-900 px-4 py-2 text-xs font-extrabold text-white disabled:opacity-60 dark:bg-amber-200 dark:text-amber-950"
+            >
+              {endingUserView ? 'Exiting...' : 'Exit User View'}
+            </button>
+          </div>
+        )}
+        <main ref={mainContentRef} className="flex-1 overflow-auto p-5 sm:p-6">
+          <div key={loc.pathname} className="min-h-[calc(100vh-7rem)]">
+            {COORDINATED_LOADING_ROUTES.has(loc.pathname) ||
+            COORDINATED_LOADING_ROUTE_PATTERNS.some((pattern) =>
+              pattern.test(loc.pathname)
+            ) ? (
+              <RouteInitialLoading animate={shouldAnimateRoute}>
+                <Outlet />
+              </RouteInitialLoading>
+            ) : (
+              <Suspense fallback={<RouteRefreshSkeleton />}>
+                <AuthHydrationGate>
+                  <div
+                    className={
+                      shouldAnimateRoute ? 'animate-fade-in-up' : undefined
+                    }
+                  >
+                    <Outlet />
+                  </div>
+                </AuthHydrationGate>
+              </Suspense>
+            )}
+          </div>
         </main>
       </div>
 
@@ -622,7 +979,11 @@ export default function DashboardLayout() {
         onCancel={() => setShowLogoutConfirm(false)}
         danger={true}
       />
-      <FloatingChatbot />
+      {loc.pathname !== '/profile' && canUseFloatingChatbot && (
+        <Suspense fallback={null}>
+          <FloatingChatbot />
+        </Suspense>
+      )}
     </div>
   );
 }

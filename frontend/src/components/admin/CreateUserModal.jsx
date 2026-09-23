@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { getApiErrorMessage } from '../../lib/apiError';
 import {
   Mail,
   Lock,
@@ -12,6 +13,7 @@ import {
   X,
 } from 'lucide-react';
 import api from '../../lib/axios';
+import useAuthStore from '../../store/auth';
 import CustomSelect from '../CustomSelect';
 
 const ROLE_OPTIONS = [
@@ -31,6 +33,15 @@ const LABELS = {
 };
 
 export default function CreateUserModal({ open, onClose }) {
+  const currentUser = useAuthStore((state) => state.user);
+  const isAdmin = currentUser?.role === 'ADMIN';
+  const allowedRoleOptions = isAdmin
+    ? ROLE_OPTIONS
+    : ROLE_OPTIONS.filter((option) =>
+        currentUser?.role === 'SENIOR_TL'
+          ? ['TL', 'CAPTAIN', 'INTERN'].includes(option.value)
+          : ['CAPTAIN', 'INTERN'].includes(option.value)
+      );
   const queryClient = useQueryClient();
   const [full_name, setfull_name] = useState('');
   const [email, setEmail] = useState('');
@@ -46,6 +57,10 @@ export default function CreateUserModal({ open, onClose }) {
     if (!open) return undefined;
 
     document.body.classList.add('modal-open');
+
+    if (!isAdmin && currentUser?.departmentId) {
+      setDepartmentId(currentUser.departmentId);
+    }
 
     return () => {
       document.body.classList.remove('modal-open');
@@ -136,7 +151,7 @@ export default function CreateUserModal({ open, onClose }) {
       }, 1400);
     },
     onError: (err) => {
-      setError(err.response?.data?.error || 'Registration failed');
+      setError(getApiErrorMessage(err, 'Registration failed'));
       setSuccessMsg('');
     },
   });
@@ -163,7 +178,9 @@ export default function CreateUserModal({ open, onClose }) {
       email,
       password,
       role,
-      departmentId: departmentId || undefined,
+      departmentId: isAdmin
+        ? departmentId || undefined
+        : currentUser?.departmentId,
       managerId: managerId || undefined,
     };
 
@@ -253,6 +270,7 @@ export default function CreateUserModal({ open, onClose }) {
                   <Mail className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 dark:text-slate-500" />
                   <input
                     type="email"
+                    maxLength={254}
                     required
                     placeholder="johndoe@company.com"
                     value={email}
@@ -269,6 +287,7 @@ export default function CreateUserModal({ open, onClose }) {
                   <Lock className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 dark:text-slate-500" />
                   <input
                     type={showPassword ? 'text' : 'password'}
+                    maxLength={128}
                     required
                     placeholder="Minimum 8 characters"
                     value={password}
@@ -302,7 +321,7 @@ export default function CreateUserModal({ open, onClose }) {
                       setRole(value);
                       setManagerId(''); // Reset manager on role change
                     }}
-                    options={ROLE_OPTIONS}
+                    options={allowedRoleOptions}
                     placeholder="Select Role"
                     disabled={registerMutation.isPending}
                     className="[&>button]:pl-11"
@@ -320,8 +339,8 @@ export default function CreateUserModal({ open, onClose }) {
                     value={departmentId}
                     onChange={setDepartmentId}
                     options={departmentOptions}
+                    disabled={!isAdmin || registerMutation.isPending}
                     placeholder="Select Dept"
-                    disabled={registerMutation.isPending}
                     className="[&>button]:pl-11"
                   />
                 </div>

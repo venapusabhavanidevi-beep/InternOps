@@ -317,7 +317,9 @@ function getKBResponse(text) {
   }
   if (t.includes('audit') || t.includes('log')) return KB.audit;
 
-  return null;
+  return `I can help with InternOps-related questions such as ratings, attendance, tasks, proof verification, reports, sessions, meetings, permissions, and audit logs.
+
+  Please ask me something related to the InternOps platform.`;
 }
 
 function parseBold(text) {
@@ -563,7 +565,7 @@ export default function InternOpsAssistant() {
   const [input, setInput] = useState('');
   const [isTyping, setIsTyping] = useState(false);
   const [history, setHistory] = useState([]);
-  const messagesEndRef = useRef(null);
+  const chatScrollRef = useRef(null);
   const inputRef = useRef(null);
 
   const now = () =>
@@ -623,38 +625,66 @@ ${perms.cannotDo.map((item) => `- ${item}`).join('\n')}`;
       }
 
       try {
-        const systemPrompt = `You are the InternOps Assistant. The user's current role is: ${role}. Give concise, role-aware answers about InternOps modules, permissions, ratings, attendance, tasks, reports, sessions, meetings, and audit logs.`;
+        // 1️⃣ Query AIML Chatbot endpoint first
+        let chatbotResponse = null;
+        try {
+          const cbRes = await api.post(
+            '/chatbot/message',
+            { message: msg },
+            { _suppressGlobalError: true }
+          );
+          chatbotResponse = cbRes.data;
+          if (
+            chatbotResponse?.response &&
+            chatbotResponse.source !== 'fallback'
+          ) {
+            setIsTyping(false);
+            addBotMessage(chatbotResponse.response);
+            return;
+          }
+        } catch (cbErr) {
+          // Fall through to AI chat if available
+        }
 
-        const response = await api.post(
-          '/ai/chat',
-          {
-            messages: [
-              {
-                role: 'system',
-                content: systemPrompt,
-              },
-              ...history.slice(-6).map((item) => ({
-                role: item.role === 'bot' ? 'assistant' : item.role,
-                content: item.content,
-              })),
-              {
-                role: 'user',
-                content: msg,
-              },
-            ],
-          },
-          // The failure is already surfaced as an in-chat message below, so
-          // suppress the global error toast to avoid showing the user two
-          // separate error messages for the same failed request (#1795).
-          { _suppressGlobalError: true }
-        );
+        // 2️⃣ Fall back to AI chat for manager roles if needed
+        const roleKey = role.toUpperCase().replace(/\s+/g, '_');
+        if (['ADMIN', 'SENIOR_TL', 'TL'].includes(roleKey)) {
+          const systemPrompt = `You are the InternOps Assistant. The user's current role is: ${role}. Give concise, role-aware answers about InternOps modules, permissions, ratings, attendance, tasks, reports, sessions, meetings, and audit logs.`;
 
-        const answer =
-          response.data?.content ||
-          "Sorry, I couldn't process that. Please try rephrasing.";
+          const response = await api.post(
+            '/ai/chat',
+            {
+              messages: [
+                {
+                  role: 'system',
+                  content: systemPrompt,
+                },
+                ...history.slice(-6).map((item) => ({
+                  role: item.role === 'bot' ? 'assistant' : item.role,
+                  content: item.content,
+                })),
+                {
+                  role: 'user',
+                  content: msg,
+                },
+              ],
+            },
+            { _suppressGlobalError: true }
+          );
+
+          const answer = response.data?.content;
+          if (answer) {
+            setIsTyping(false);
+            addBotMessage(answer);
+            return;
+          }
+        }
 
         setIsTyping(false);
-        addBotMessage(answer);
+        addBotMessage(
+          chatbotResponse?.response ||
+            'I’m not sure about that yet. Please try rephrasing your question or contact your mentor/support team.'
+        );
       } catch (err) {
         setIsTyping(false);
         const { message, retryable } = getAiChatErrorMessage(err);
@@ -688,15 +718,16 @@ I can help you understand platform workflows, role permissions, and daily operat
     };
 
     setMessages([welcome]);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
   useEffect(() => {
-    if (
-      messagesEndRef.current &&
-      typeof messagesEndRef.current.scrollIntoView === 'function'
-    ) {
-      messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    // Keep the initial welcome view at the top. Later chat activity scrolls only
+    // the conversation panel, never the Dashboard page container.
+    if (messages.length <= 1 && !isTyping) return;
+    if (chatScrollRef.current) {
+      chatScrollRef.current.scrollTo({
+        top: chatScrollRef.current.scrollHeight,
+        behavior: 'smooth',
+      });
     }
   }, [messages, isTyping]);
 
@@ -735,7 +766,7 @@ Select your **role** in the top-right to get role-aware answers. I can help with
   ];
 
   return (
-    <div className="animate-fade-in-up h-[calc(100vh-6.5rem)] min-h-[680px] max-h-[calc(100vh-6.5rem)]">
+    <div className="h-[calc(100vh-6.5rem)] min-h-[680px] max-h-[calc(100vh-6.5rem)]">
       <div className="h-full rounded-[2rem] overflow-hidden border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 shadow-[0_18px_45px_rgba(15,23,42,0.08)] dark:shadow-none flex flex-col">
         {/* Header */}
         <div className="relative overflow-hidden bg-gradient-to-r from-indigo-600 via-blue-600 to-violet-600 text-white shrink-0">
@@ -811,15 +842,16 @@ Select your **role** in the top-right to get role-aware answers. I can help with
         {tab === 'chat' && (
           <div className="min-h-0 flex-1 flex overflow-hidden">
             <div className="min-w-0 flex-1 flex flex-col bg-slate-50 dark:bg-slate-950 overflow-hidden">
-              <div className="min-h-0 flex-1 overflow-y-auto px-4 md:px-6 py-5">
+              <div
+                ref={chatScrollRef}
+                className="min-h-0 flex-1 overflow-y-auto px-4 md:px-6 py-5"
+              >
                 <div className="max-w-5xl mx-auto">
                   {messages.map((msg, index) => (
                     <Message key={index} msg={msg} />
                   ))}
 
                   {isTyping && <TypingBubble />}
-
-                  <div ref={messagesEndRef} />
                 </div>
               </div>
 

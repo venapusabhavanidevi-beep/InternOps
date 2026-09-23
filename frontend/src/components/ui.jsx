@@ -2,6 +2,7 @@ import { useEffect, useState, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { AlertCircle, Eye, EyeOff, RefreshCw } from 'lucide-react';
 import useBodyScrollLock from '../hooks/useBodyScrollLock';
+import { getApiErrorMessage } from '../lib/apiError';
 // Shared, reusable UI building blocks for a consistent, polished, animated look.
 
 export function PageHeader({ title, subtitle, icon, actions }) {
@@ -52,11 +53,18 @@ export function UserAvatar({
   size = 'w-9 h-9',
   text = 'text-sm',
 }) {
-  if (src) {
+  const [imageError, setImageError] = useState(false);
+
+  useEffect(() => {
+    setImageError(false);
+  }, [src]);
+
+  if (src && !imageError) {
     return (
       <img
         src={src}
         alt=""
+        onError={() => setImageError(true)}
         className={`${size} rounded-full object-cover border border-white/70 dark:border-slate-700 shadow-sm`}
       />
     );
@@ -75,22 +83,12 @@ export function Card({ children, className = '', hover = false, ...props }) {
   return (
     <div
       {...props}
-      className={`relative overflow-hidden rounded-3xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 shadow-[0_12px_30px_rgba(15,23,42,0.06)] dark:shadow-none text-slate-900 dark:text-white ${
+      className={`relative overflow-hidden rounded-3xl border border-slate-200/90 dark:border-slate-700 bg-gradient-to-br from-white via-white to-slate-50/80 dark:bg-none dark:bg-slate-900 shadow-[0_16px_38px_-24px_rgba(15,23,42,0.34),0_5px_14px_-10px_rgba(79,70,229,0.16)] dark:shadow-none text-slate-900 dark:text-white ${
         hover ? 'card-hover cursor-pointer' : ''
       } ${className}`}
     >
       {children}
     </div>
-  );
-}
-
-function getApiErrorMessage(error, fallback) {
-  return (
-    error?.response?.data?.error ||
-    error?.response?.data?.message ||
-    error?.message ||
-    fallback ||
-    'Something went wrong. Please try again.'
   );
 }
 
@@ -248,6 +246,7 @@ export function StatCard({
   value,
   sub,
   icon,
+  badge,
   gradient = 'from-indigo-500 to-blue-600',
 }) {
   return (
@@ -271,6 +270,8 @@ export function StatCard({
               {sub}
             </p>
           )}
+
+          {badge && <div className="mt-2">{badge}</div>}
         </div>
 
         {icon && (

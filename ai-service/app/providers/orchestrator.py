@@ -6,6 +6,7 @@ import logging
 from typing import Dict, Any, List, Optional, Tuple
 
 from app.core.config import settings
+from app.core.cache import cache_key, get_cached, set_cached
 from app.core.redis_client import get_redis
 from app.providers.base import AIProviderError, ProviderAPIError
 from app.providers.registry import get_provider
@@ -15,39 +16,28 @@ logger = logging.getLogger(__name__)
 
 def generate_cache_key(
     prompt: str,
-    provider_name: str,
     temperature: float,
     kwargs: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Generates a deterministic SHA-256 cache key from request parameters.
+    Delegates to app.core.cache.cache_key for consistent key generation.
     """
-    normalized_kwargs = kwargs or {}
-    
-    # Exclude non-serializable or schema objects if passed as kwargs to ensure clean serialization
-    serializable_kwargs = {}
-    for k, v in normalized_kwargs.items():
-        try:
-            json.dumps(v)
-            serializable_kwargs[k] = v
-        except (TypeError, OverflowError):
-            serializable_kwargs[k] = str(v)
-
-    payload = {
-        "prompt": prompt,
-        "provider": provider_name.lower().strip(),
-        "temperature": float(temperature),
-        "kwargs": sorted(serializable_kwargs.items()),
-    }
-    serialized = json.dumps(payload, sort_keys=True)
-    hash_digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
-    return f"ai_cache:{hash_digest}"
+    kw = kwargs or {}
+    return cache_key(
+        provider="",
+        model="",
+        prompt=prompt,
+        temperature=temperature,
+        **{k: v for k, v in kw.items() if k not in ("model", "provider", "provider_name")},
+    )
 
 
 class CircuitBreaker:
     def __init__(self):
         self.failures = 0
         self.disabled_until: Optional[float] = None
+        self.half_open_probe: bool = False
         self._lock = asyncio.Lock()
 
     async def is_open(self) -> bool:
@@ -66,16 +56,23 @@ class CircuitBreaker:
                 if time.time() < self.disabled_until:
                     return False
                 else:
-                    # Cooldown expired, transition to CLOSED/probe state (state mutation)
-                    self.failures = 0
-                    self.disabled_until = None
+                    # Cooldown expired, transition to HALF-OPEN/probe state
+                    if self.half_open_probe:
+                        return False
+                    self.half_open_probe = True
+                    return True
             return True
 
     async def record_failure(self):
         async with self._lock:
+            cooldown_seconds = settings.AI_PROVIDER_COOLDOWN_MS / 1000.0
+            if self.half_open_probe:
+                self.half_open_probe = False
+                self.disabled_until = time.time() + cooldown_seconds
+                return
+
             self.failures += 1
             limit = settings.AI_PROVIDER_FAILURE_LIMIT
-            cooldown_seconds = settings.AI_PROVIDER_COOLDOWN_MS / 1000.0
             if self.failures >= limit:
                 self.disabled_until = time.time() + cooldown_seconds
 
@@ -83,6 +80,7 @@ class CircuitBreaker:
         async with self._lock:
             self.failures = 0
             self.disabled_until = None
+            self.half_open_probe = False
 
 
 # In-memory registry of circuit breakers per provider
@@ -140,9 +138,10 @@ class AIOrchestrator:
         prompt: str,
         **kwargs,
     ) -> Tuple[str, str]:
-        return await self._execute_with_failover(
+        result, provider_name, _cached = await self._execute_with_failover(
             "generate_image", prompt, **kwargs
         )
+        return result, provider_name
 
     async def generate_text_with_fallback(
         self,
@@ -150,12 +149,13 @@ class AIOrchestrator:
         temperature: float = 0.7,
         **kwargs,
     ) -> Tuple[str, str]:
-        return await self._execute_with_failover(
+        result, provider_name, _cached = await self._execute_with_failover(
             "generate_text",
             prompt,
             temperature=temperature,
             **kwargs,
         )
+        return result, provider_name
 
     async def generate_chat_with_fallback(
         self,
@@ -163,6 +163,32 @@ class AIOrchestrator:
         temperature: float = 0.7,
         **kwargs,
     ) -> Tuple[str, str]:
+        content, provider_name, _cached = await self._execute_with_failover(
+            "generate_chat",
+            messages,
+            temperature=temperature,
+            **kwargs
+        )
+        return content, provider_name
+
+    async def generate_chat_with_cache_status(
+        self,
+        messages: list[dict],
+        temperature: float = 0.7,
+        **kwargs,
+    ) -> Tuple[str, str, bool]:
+        """
+        Same as generate_chat_with_fallback(), but also reports whether the
+        response came from the orchestrator's cache (see cache_key() /
+        _execute_with_failover() below) instead of a live provider call.
+
+        POST /ai/chat is the one caller that needs this, since its response
+        body includes a `cached` flag. Every other caller keeps using
+        generate_chat_with_fallback()/generate_text_with_fallback()/etc.,
+        which still return the plain (result, provider_name) pair — the
+        caching itself is identical either way, this just also surfaces
+        the hit/miss status instead of discarding it.
+        """
         return await self._execute_with_failover(
             "generate_chat",
             messages,
@@ -182,13 +208,14 @@ class AIOrchestrator:
         and falling back to active secondary providers if failures occur.
         Returns (parsed_json_dict, successful_provider_name).
         """
-        return await self._execute_with_failover(
+        result, provider_name, _cached = await self._execute_with_failover(
             "generate_json", prompt, schema=schema, temperature=temperature, **kwargs
         )
+        return result, provider_name
 
     async def _execute_with_failover(
         self, method_name: str, *args, **kwargs
-    ) -> Tuple[Any, str]:
+    ) -> Tuple[Any, str, bool]:
         primary = settings.PRIMARY_AI_PROVIDER
         fallbacks = settings.ACTIVE_FALLBACK_PROVIDERS
 
@@ -223,30 +250,23 @@ class AIOrchestrator:
                 )
                 continue
 
-            cache_key = generate_cache_key(
+            c_key = generate_cache_key(
                 prompt=prompt,
-                provider_name=provider_name,
                 temperature=temperature,
-                kwargs={
-                 **kwargs,
-                 "model": provider.model_name,
-                  },
+                kwargs=kwargs,
             )
-            # 1. Check Redis Cache
-            redis = get_redis()
-            if redis:
-                try:
-                    cached_val = await redis.get(cache_key)
-                    if cached_val:
-                        logger.info(
-                            f"AI response cache hit for provider '{provider_name}'."
-                        )
-                        cached_result = json.loads(cached_val)
-                        return cached_result, provider.provider_name
-                except Exception as e:
-                    logger.warning(
-                        f"Redis cache read failed for key '{cache_key}': {str(e)}"
+            # 1. Check TTL Cache (In-Memory + Redis)
+            try:
+                cached_val = await get_cached(c_key)
+                if cached_val is not None:
+                    logger.info(
+                        f"AI response cache hit for provider '{provider_name}'."
                     )
+                    return cached_val, provider.provider_name, True
+            except Exception as e:
+                logger.warning(
+                    f"Cache read failed for key '{c_key}': {str(e)}"
+                )
 
             # 2. Call Provider on Cache Miss
             try:
@@ -263,19 +283,15 @@ class AIOrchestrator:
                 await cb.record_success()
 
                 # 3. Cache Result on Success
-                if redis and result is not None:
+                if result is not None:
                     try:
-                        await redis.set(
-                            name=cache_key,
-                            value=json.dumps(result),
-                            ex=settings.AI_CACHE_TTL,
-                        )
+                        await set_cached(c_key, result)
                     except Exception as e:
                         logger.warning(
-                            f"Redis cache write failed for key '{cache_key}': {str(e)}"
+                            f"Cache write failed for key '{c_key}': {str(e)}"
                         )
 
-                return result, provider.provider_name
+                return result, provider.provider_name, False
 
             except ProviderAPIError as e:
                 # 413 Entity Too Large is unrecoverable, propagate immediately without failover

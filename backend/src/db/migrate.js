@@ -16,6 +16,8 @@ const RETRY_DELAY_MS = 100;
 const MIGRATION_LOCK_ID = 727100;
 
 const MIGRATION_RENAMES = {
+  '057_task_prerequisites.sql': '058_task_prerequisites.sql',
+  '055_keyset_pagination_indexes.sql': '056_keyset_pagination_indexes.sql',
   '003_password_reset.sql': '004_password_reset.sql',
   '010_member_details.sql': '005_member_details.sql',
   '011_email_verification.sql': '006_email_verification.sql',
@@ -45,6 +47,11 @@ const MIGRATION_RENAMES = {
   '036_workbook_profile_enrichment.sql': '042_workbook_profile_enrichment.sql',
   '037_weekly_rating_import.sql': '043_weekly_rating_import.sql',
   '038_department_senior_tl_unique.sql': '044_department_senior_tl_unique.sql',
+  '029_notices_enhancements.sql': '046_notices_enhancements.sql',
+  '037_add_hr_management_roles.sql': '047_add_hr_management_roles.sql',
+  '046_add_hr_management_roles.sql': '047_add_hr_management_roles.sql',
+  '051_refresh_token_recovery.sql': '052_refresh_token_recovery.sql',
+  '054_performance_risk_alerts.sql': '057_performance_risk_alerts.sql',
 };
 
 const fsPromises = fs.promises;

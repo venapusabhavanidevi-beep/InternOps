@@ -1,19 +1,31 @@
 const pool = require('../../config/db');
 const { assertActivityAllowed } = require('../team/lifecycle');
+const { MAX_HIERARCHY_DEPTH, roleRankSql } = require('../../utils/hierarchy');
+const {
+  getFourWeekIndex,
+  getFourWeekRatingPeriods,
+} = require('./ratingPeriods');
 
-async function addRating(rated, by, score, remarks) {
-  await assertActivityAllowed(
-    pool,
-    rated,
-    new Date().toISOString().slice(0, 10)
-  );
-  const res = await pool.query(
-    'INSERT INTO ratings (rated_user_id, rated_by, score, remarks) VALUES ($1,$2,$3,$4) RETURNING *',
-    [rated, by, score, remarks]
-  );
-  return res.rows[0];
+async function addRating(rated, by, score, remarks, periodStart, periodEnd) {
+  await assertActivityAllowed(pool, rated, periodEnd);
+  const periodKey = `${rated}:${periodStart}:${periodEnd}`;
+  try {
+    const res = await pool.query(
+      `INSERT INTO ratings (rated_user_id,rated_by,score,remarks,rating_period_start,rating_period_end,manual_period_key)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [rated, by, score, remarks, periodStart, periodEnd, periodKey]
+    );
+    return res.rows[0];
+  } catch (error) {
+    if (error.code === '23505') {
+      throw Object.assign(
+        new Error('A rating already exists for this member and week'),
+        { statusCode: 409 }
+      );
+    }
+    throw error;
+  }
 }
-
 async function getRatings(userId) {
   const res = await pool.query(
     'SELECT * FROM ratings WHERE rated_user_id=$1 AND deleted_at IS NULL ORDER BY created_at DESC',
@@ -32,31 +44,43 @@ async function getDepartmentRatingsSheet({
 }) {
   const departmentWide = isAdmin || requesterRole === 'SENIOR_TL';
   const memberScope = departmentWide
-    ? `SELECT id, full_name, email, role, department_id, intern_code,
-              internship_status, suspended
-       FROM users
-       WHERE department_id = $1 AND deleted_at IS NULL`
+    ? `SELECT u.id, u.full_name, u.email, u.role, u.department_id, u.intern_code,
+              u.internship_status, u.suspended
+       FROM users u
+       WHERE u.department_id = $1 AND u.deleted_at IS NULL
+       ORDER BY ${roleRankSql('u')},
+         LOWER(COALESCE(NULLIF(TRIM(u.full_name), ''), u.email)),
+         LOWER(u.email), u.id`
     : `WITH RECURSIVE visible_users AS (
-         SELECT id, full_name, email, role, department_id, manager_id,
-                intern_code, internship_status, suspended, 0 AS depth
-         FROM users
-         WHERE id = $2 AND deleted_at IS NULL
+         SELECT u.id, u.full_name, u.email, u.role, u.department_id, u.manager_id,
+                u.intern_code, u.internship_status, u.suspended,
+                0 AS depth, ARRAY[u.id] AS path,
+                ${roleRankSql('u')} AS structural_rank
+         FROM users u
+         WHERE u.id = $2 AND u.deleted_at IS NULL
          UNION ALL
          SELECT u.id, u.full_name, u.email, u.role, u.department_id, u.manager_id,
                 u.intern_code, u.internship_status, u.suspended,
-                visible_users.depth + 1
-         FROM users u
-         INNER JOIN visible_users ON u.manager_id = visible_users.id
-         WHERE u.deleted_at IS NULL AND visible_users.depth < 100
+                visible_users.depth + 1, visible_users.path || u.id,
+                ${roleRankSql('u')} AS structural_rank
+         FROM visible_users
+         INNER JOIN users u
+           ON u.manager_id = visible_users.id
+          AND u.deleted_at IS NULL
+          AND NOT u.id = ANY(visible_users.path)
+         WHERE visible_users.depth < $3
        )
        SELECT id, full_name, email, role, department_id, intern_code,
               internship_status, suspended
        FROM visible_users
-       WHERE department_id = $1`;
+       WHERE department_id = $1
+       ORDER BY depth, structural_rank,
+         LOWER(COALESCE(NULLIF(TRIM(full_name), ''), email)),
+         LOWER(email), id`;
 
   const memberParams = departmentWide
     ? [departmentId]
-    : [departmentId, requesterId];
+    : [departmentId, requesterId, MAX_HIERARCHY_DEPTH];
   const membersResult = await pool.query(memberScope, memberParams);
   const members = membersResult.rows;
   const memberIds = members.map((member) => member.id);
@@ -103,6 +127,8 @@ async function getDepartmentRatingsSheet({
     [memberIds, from, to]
   );
 
+  const selectedMonth = String(from).slice(0, 7);
+  const officialPeriods = getFourWeekRatingPeriods(selectedMonth);
   const grouped = new Map();
   for (const row of ratingsResult.rows) {
     if (!grouped.has(row.rated_user_id)) grouped.set(row.rated_user_id, []);
@@ -110,9 +136,36 @@ async function getDepartmentRatingsSheet({
   }
 
   return {
-    available_months: availableMonthsResult.rows.map((row) => row.month),
+    available_months: [
+      selectedMonth,
+      ...availableMonthsResult.rows
+        .map((row) => row.month)
+        .filter((month) => month !== selectedMonth),
+    ],
     members: members.map((member) => {
       const userRatings = grouped.get(member.id) || [];
+      const newestByWeek = new Map();
+      for (const rating of [...userRatings].sort(
+        (a, b) => new Date(b.created_at) - new Date(a.created_at)
+      )) {
+        const startValue =
+          rating.rating_period_start || String(rating.created_at).slice(0, 10);
+        const weekIndex = getFourWeekIndex(startValue);
+        if (weekIndex >= 0 && !newestByWeek.has(weekIndex))
+          newestByWeek.set(weekIndex, rating);
+      }
+      const normalizedRatings = officialPeriods
+        .map((period, index) => {
+          const rating = newestByWeek.get(index);
+          return rating
+            ? {
+                ...rating,
+                rating_period_start: period.start,
+                rating_period_end: period.end,
+              }
+            : null;
+        })
+        .filter(Boolean);
       const latest = userRatings.find((rating) => Number(rating.recency) === 1);
       const average = userRatings.length
         ? userRatings.reduce((sum, rating) => sum + Number(rating.score), 0) /
@@ -126,7 +179,7 @@ async function getDepartmentRatingsSheet({
         latest_score: latest ? Number(latest.score) : null,
         latest_remarks: latest?.remarks || null,
         latest_created_at: latest?.created_at || null,
-        weekly_ratings: userRatings.map((rating) => ({
+        weekly_ratings: normalizedRatings.map((rating) => ({
           score: rating.score == null ? null : Number(rating.score),
           remarks: rating.remarks || null,
           created_at: rating.created_at,

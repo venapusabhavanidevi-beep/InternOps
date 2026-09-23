@@ -6,6 +6,8 @@ on:
   pull_request:
     branches: [master]
 
+  merge_group:
+    branches: [master]
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -33,9 +35,7 @@ jobs:
       JWT_REFRESH_SECRET: ci-test-refresh-secret
       JWT_REFRESH_EXPIRES_IN: 7d
       PORT: 5000
-      CORS_ORIGIN: http://localhost:5173
-      SEED_ADMIN_EMAIL: admin@internops.com
-      SEED_ADMIN_PASSWORD: Admin@123
+      CORS_ORIGINS: http://localhost:5173
 
     steps:
       - name: Checkout code
@@ -51,8 +51,13 @@ jobs:
       - name: Install all dependencies
         run: npm ci --no-audit --no-fund
 
+      - name: Generate isolated CI administrator credentials
+        shell: bash
+        run: |
+          echo "SEED_ADMIN_EMAIL=admin@internops.com" >> "$GITHUB_ENV"
+          echo "SEED_ADMIN_PASSWORD=$(openssl rand -base64 36 | tr -d '\n')" >> "$GITHUB_ENV"
       - name: Run backend linting
-        run: cd backend && npm run lint
+        run: cd backend && npm run lint && npm run lint:db
 
       - name: Wait for PostgreSQL
         env:
@@ -69,6 +74,14 @@ jobs:
         run: |
           psql -h localhost -p 5432 -U postgres -d internops_test \
             -c "SELECT current_user, current_database();"
+
+      - name: Validate migration filenames
+
+        run: |
+
+          cd backend
+
+          node -e "const fs=require('fs'); const files=fs.readdirSync('migrations').filter(f=>f.endsWith('.sql')).sort(); const seen=new Map(); for(const f of files){if(!/^\d{3}_[a-z0-9_]+\.sql$/.test(f)) throw new Error('Invalid migration filename: '+f); const p=f.slice(0,3); if(seen.has(p)) throw new Error('Duplicate migration prefix '+p+': '+seen.get(p)+' and '+f); seen.set(p,f);} console.log('Validated '+files.length+' migration filenames');"
 
       - name: Run migrations
         env:
